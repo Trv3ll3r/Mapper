@@ -436,6 +436,279 @@ def detect_waf_by_probe(
         return {}, {}, "", 0, str(e)
 
 
+# ── Application-layer proxy chain extraction ─────────────────────────────────
+
+def extract_proxy_chain(resp_headers: Dict[str, str]) -> List[Dict[str, str]]:
+    """
+    Parse X-Forwarded-For, Forwarded, Via and X-Real-IP headers to reconstruct
+    the chain of proxies/load-balancers the application actually sees.
+    Returns list of dicts: [{ip, source_header, hostname}]
+    """
+    chain: List[Dict[str, str]] = []
+    headers_lower = {k.lower(): v for k, v in resp_headers.items()}
+
+    # X-Forwarded-For: client, proxy1, proxy2, ...
+    xff = headers_lower.get("x-forwarded-for", "")
+    if xff:
+        for raw_ip in [x.strip() for x in xff.split(",")]:
+            ip = raw_ip.split(":")[0]  # strip port if present
+            try:
+                ipaddress.ip_address(ip)
+                chain.append({"ip": ip, "source": "X-Forwarded-For",
+                               "hostname": reverse_dns(ip)})
+            except ValueError:
+                pass
+
+    # Forwarded: for=<ip>;by=<ip>;host=<host>;proto=<proto>
+    forwarded = headers_lower.get("forwarded", "")
+    for part in forwarded.split(","):
+        for segment in part.split(";"):
+            segment = segment.strip()
+            if segment.lower().startswith("for="):
+                raw = segment[4:].strip('"').strip("[]")
+                ip = raw.split(":")[0]
+                try:
+                    ipaddress.ip_address(ip)
+                    if not any(e["ip"] == ip for e in chain):
+                        chain.append({"ip": ip, "source": "Forwarded",
+                                      "hostname": reverse_dns(ip)})
+                except ValueError:
+                    pass
+
+    # X-Real-IP: single upstream IP (nginx convention)
+    real_ip = headers_lower.get("x-real-ip", "").strip()
+    if real_ip:
+        try:
+            ipaddress.ip_address(real_ip)
+            if not any(e["ip"] == real_ip for e in chain):
+                chain.append({"ip": real_ip, "source": "X-Real-IP",
+                              "hostname": reverse_dns(real_ip)})
+        except ValueError:
+            pass
+
+    # Via: 1.1 proxy1.example.com (squid/4.x), 1.1 proxy2.example.com
+    via = headers_lower.get("via", "")
+    for segment in via.split(","):
+        segment = segment.strip()
+        # format: version proxy-name [comment]
+        parts = segment.split()
+        if len(parts) >= 2:
+            proxy_name = parts[1].split(":")[0]  # strip port
+            if proxy_name and proxy_name not in ("anonymous", "unknown"):
+                try:
+                    ipaddress.ip_address(proxy_name)
+                    entry = {"ip": proxy_name, "source": "Via",
+                             "hostname": reverse_dns(proxy_name)}
+                except ValueError:
+                    entry = {"ip": "", "source": "Via", "hostname": proxy_name}
+                if not any(
+                    e["ip"] == entry["ip"] and e["hostname"] == entry["hostname"]
+                    for e in chain
+                ):
+                    chain.append(entry)
+
+    return chain
+
+
+# ── Firewall behaviour fingerprinting ─────────────────────────────────────────
+
+FIREWALL_SIGNATURES = {
+    # (icmp_type, icmp_code) → (name, description)
+    (3, 0):  ("Router/FW",     "Network unreachable — routing failure or ACL"),
+    (3, 1):  ("Router/FW",     "Host unreachable — host-based firewall or no route"),
+    (3, 2):  ("FW",            "Protocol unreachable — protocol filtering"),
+    (3, 3):  ("FW",            "Port unreachable — port filtered (stateless FW)"),
+    (3, 9):  ("ACL FW",        "Net admin prohibited — router ACL"),
+    (3, 10): ("ACL FW",        "Host admin prohibited — router ACL"),
+    (3, 11): ("ACL FW",        "Net ToS admin prohibited"),
+    (3, 12): ("ACL FW",        "Host ToS admin prohibited"),
+    (3, 13): ("Stateful FW",   "Admin prohibited — stateful firewall (iptables REJECT)"),
+}
+
+TCP_FW_SIGNATURES = {
+    # tcp_flags bitmask → (name, description)
+    0x04: ("FW/Host",   "RST — connection reset; port closed or stateless firewall"),
+    0x14: ("FW/Host",   "RST-ACK — connection reset by host or inline device"),
+}
+
+
+def fingerprint_firewall_hop(hop: "HopResult") -> Optional[Tuple[str, str]]:
+    """Return (firewall_type, description) if hop looks like a firewall."""
+    if hop.icmp_type is not None and hop.icmp_code is not None:
+        key = (hop.icmp_type, hop.icmp_code)
+        if key in FIREWALL_SIGNATURES:
+            return FIREWALL_SIGNATURES[key]
+    return None
+
+
+def classify_silence(ttl_before: int, ttl_after: int, target_reached: bool) -> str:
+    """Interpret a block of timeout hops."""
+    span = ttl_after - ttl_before
+    if not target_reached:
+        return (
+            f"{span} consecutive timeouts then target NOT reached — "
+            "firewall is silently dropping packets (stateful DROP rule or ACL)"
+        )
+    return (
+        f"{span} consecutive timeouts — hops are suppressing ICMP TTL-exceeded "
+        "(common for load-balancers, CDN PoPs, or firewalls with ICMP rate-limiting)"
+    )
+
+
+# ── Allowed-port discovery ────────────────────────────────────────────────────
+
+PROBE_PORTS = [
+    21, 22, 23, 25, 53, 80, 110, 143, 443, 465, 587,
+    993, 995, 3306, 3389, 5432, 6379, 8080, 8443, 8888,
+]
+
+
+def discover_allowed_ports(
+    target_ip: str,
+    ports: Optional[List[int]] = None,
+    timeout: float = 1.5,
+) -> Tuple[List[int], List[int]]:
+    """
+    Connect-scan to classify ports as open, closed (RST), or filtered (no reply).
+    Returns (open_ports, filtered_ports).
+    Filtered = firewall is passing the SYN but the port isn't listening,
+    or the firewall is silently dropping.  We distinguish by timeout vs RST.
+    """
+    if ports is None:
+        ports = PROBE_PORTS
+
+    open_ports: List[int] = []
+    filtered_ports: List[int] = []
+
+    for port in ports:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((target_ip, port))
+            sock.close()
+            if result == 0:
+                open_ports.append(port)
+            elif result in (111, 10061):  # ECONNREFUSED — RST received
+                pass  # port closed but reachable (FW passes traffic)
+        except socket.timeout:
+            filtered_ports.append(port)  # silence — likely filtered
+        except Exception:
+            pass
+
+    return open_ports, filtered_ports
+
+
+# ── Multi-port TCP SYN traceroute ─────────────────────────────────────────────
+
+def multi_port_traceroute(
+    target_ip: str,
+    ports: Optional[List[int]] = None,
+    max_hops: int = 30,
+    timeout: float = 2.0,
+    probes_per_hop: int = 2,
+) -> Dict[int, List["HopResult"]]:
+    """
+    Run TCP SYN traceroute simultaneously on several ports.
+    Firewalls often block one port but pass another — comparing paths
+    reveals where filtering begins and which path goes through.
+    Returns {port: [HopResult, ...]}
+    """
+    if not SCAPY_AVAILABLE:
+        return {}
+    if ports is None:
+        ports = [80, 443, 8080, 8443]
+
+    results: Dict[int, List[HopResult]] = {}
+    for port in ports:
+        results[port] = tcp_syn_traceroute(
+            target_ip,
+            dest_port=port,
+            max_hops=max_hops,
+            timeout=timeout,
+            probes_per_hop=probes_per_hop,
+        )
+    return results
+
+
+# ── UDP traceroute ────────────────────────────────────────────────────────────
+
+def udp_traceroute_scapy(
+    target_ip: str,
+    dest_port: int = 33434,
+    max_hops: int = 30,
+    timeout: float = 2.0,
+) -> List["HopResult"]:
+    """
+    UDP-based traceroute (classic style, like unix traceroute).
+    Uses incrementing dest ports starting at dest_port.
+    Receives ICMP port-unreachable at the target to confirm arrival.
+    """
+    if not SCAPY_AVAILABLE:
+        return []
+
+    results: List[HopResult] = []
+
+    for ttl in range(1, max_hops + 1):
+        hop = HopResult(ttl)
+        pkt = IP(dst=target_ip, ttl=ttl) / UDP(sport=int(RandShort()),
+                                                 dport=dest_port + ttl)
+        t0 = time.time()
+        reply = sr1(pkt, timeout=timeout, verbose=0)
+        rtt = (time.time() - t0) * 1000
+
+        if reply is None:
+            hop.hop_type = "timeout"
+        else:
+            hop.ip = reply.src
+            hop.rtt_ms = rtt
+            hop.hostname = reverse_dns(hop.ip) if not is_private_ip(hop.ip) else ""
+
+            if reply.haslayer(ICMP):
+                icmp = reply.getlayer(ICMP)
+                hop.icmp_type = icmp.type
+                hop.icmp_code = icmp.code
+                if icmp.type == 11:
+                    hop.hop_type = "transit"
+                elif icmp.type == 3 and icmp.code == 3:
+                    hop.hop_type = "target"   # port unreachable = arrived
+                    hop.notes.append("UDP port-unreachable (target)")
+                elif icmp.type == 3:
+                    sig = FIREWALL_SIGNATURES.get((3, icmp.code))
+                    hop.hop_type = "firewall"
+                    hop.notes.append(sig[1] if sig else f"ICMP-3/{icmp.code}")
+                else:
+                    hop.hop_type = "transit"
+
+        results.append(hop)
+        if hop.hop_type == "target":
+            break
+
+    return results
+
+
+# ── Merge multi-port results ──────────────────────────────────────────────────
+
+def merge_traceroute_results(
+    port_results: Dict[int, List["HopResult"]],
+) -> List[Dict]:
+    """
+    Align hop results from multiple ports by TTL.
+    Returns list of dicts: {ttl, per_port: {port: HopResult}}
+    Useful for spotting where paths diverge or where firewall cuts off a port.
+    """
+    if not port_results:
+        return []
+    max_ttl = max((h.ttl for hops in port_results.values() for h in hops), default=0)
+    merged = []
+    for ttl in range(1, max_ttl + 1):
+        row: Dict[str, Any] = {"ttl": ttl, "per_port": {}}
+        for port, hops in port_results.items():
+            match = next((h for h in hops if h.ttl == ttl), None)
+            row["per_port"][port] = match
+        merged.append(row)
+    return merged
+
+
 # ── TCP SYN Traceroute (scapy) ────────────────────────────────────────────────
 
 class HopResult:
@@ -714,6 +987,11 @@ class NetworkMapper:
         self._http_status: int = 0
         self._tls_data: Optional[Dict] = None
         self._dns_records: Dict[str, Any] = {}
+        self._proxy_chain: List[Dict[str, str]] = []
+        self._port_results: Dict[int, List[HopResult]] = {}
+        self._udp_hops: List[HopResult] = []
+        self._allowed_ports: List[int] = []
+        self._filtered_ports: List[int] = []
 
     def run(self) -> None:
         self._print_banner()
@@ -725,6 +1003,8 @@ class NetworkMapper:
             self._http_analysis()
         if not self.args.no_traceroute:
             self._traceroute()
+        if getattr(self.args, "penetrate", False):
+            self._firewall_penetration()
         if self.args.port_scan:
             self._port_scan()
         if not self.args.no_tls and self.scheme == "https":
@@ -811,6 +1091,24 @@ class NetworkMapper:
             print(_c("  Cookies:", "cyan"))
             for name, val in list(cookies.items())[:10]:
                 info(f"    {name}", val[:60])
+
+        # Application-layer proxy chain
+        proxy_chain = extract_proxy_chain(resp_headers)
+        self._proxy_chain = proxy_chain
+        if proxy_chain:
+            print()
+            print(_c("  Application-layer Proxy Chain (from response headers):", "bold"))
+            print(_c("  (These are hops the application itself reports — may reveal", "yellow"))
+            print(_c("   internal infrastructure hidden behind the firewall)", "yellow"))
+            for i, entry in enumerate(proxy_chain):
+                display_ip   = entry["ip"] or "?"
+                display_host = f"  ({entry['hostname']})" if entry["hostname"] else ""
+                src = entry["source"]
+                print(
+                    f"    {_c(str(i+1), 'cyan')}. "
+                    f"{_c(display_ip, 'green')}{display_host}  "
+                    f"{_c('[' + src + ']', 'yellow')}"
+                )
 
         # WAF detection
         print()
@@ -903,6 +1201,190 @@ class NetworkMapper:
                 self._fallback_traceroute()
         else:
             self._fallback_traceroute()
+
+    # ── Firewall penetration analysis ─────────────────────────────────────────
+
+    def _firewall_penetration(self) -> None:
+        """
+        Advanced mode: try to map past firewalls by:
+         1. Probing which ports the firewall allows (open vs filtered)
+         2. Running TCP SYN traceroute on EACH allowed port
+         3. Running UDP traceroute (different ACL path)
+         4. Comparing paths to pinpoint where filtering occurs
+         5. Fingerprinting each firewall hop
+        """
+        header("Firewall Penetration Analysis")
+
+        # ── 1. Port allowlist discovery ──────────────────────────────────────
+        print(_c("  [1/4] Probing allowed ports through firewall …", "cyan"))
+        allowed, filtered = discover_allowed_ports(
+            self.primary_ip, timeout=self.args.timeout
+        )
+        self._allowed_ports  = allowed
+        self._filtered_ports = filtered
+
+        if allowed:
+            print(_c("  Ports with responses (firewall passes these):", "green"))
+            for p in allowed:
+                svc = COMMON_PORTS.get(p, PROBE_PORTS and "unknown" or "")
+                print(f"    {_c(str(p), 'green')}/tcp  ({svc}) — reachable")
+        if filtered:
+            print(_c("  Ports with no reply (firewall silently drops):", "yellow"))
+            for p in filtered[:12]:   # cap output
+                print(f"    {_c(str(p), 'yellow')}/tcp  — filtered / dropped")
+
+        # ── 2. Multi-port TCP SYN traceroute ─────────────────────────────────
+        if not SCAPY_AVAILABLE:
+            print(_c("\n  [!] Scapy unavailable — skipping multi-port traceroute.", "red"))
+            print(_c("      pip install scapy  (run as Administrator)", "yellow"))
+        else:
+            # Pick ports to probe: prefer ports we know the firewall allows,
+            # plus a few "hopefully allowed" ones not in the open list.
+            probe_ports = list(dict.fromkeys(
+                allowed[:4] + [80, 443, 8080, 8443]
+            ))[:6]
+            if self.port not in probe_ports:
+                probe_ports.insert(0, self.port)
+            probe_ports = probe_ports[:6]
+
+            print(
+                _c(
+                    f"\n  [2/4] Multi-port TCP SYN traceroute on ports "
+                    f"{probe_ports} …",
+                    "cyan",
+                )
+            )
+            self._port_results = multi_port_traceroute(
+                self.primary_ip,
+                ports=probe_ports,
+                max_hops=self.args.max_hops,
+                timeout=self.args.timeout,
+                probes_per_hop=2,
+            )
+            self._print_multiport_table(probe_ports)
+
+            # ── 3. UDP traceroute ─────────────────────────────────────────────
+            print(_c("\n  [3/4] UDP traceroute (classic protocol path) …", "cyan"))
+            self._udp_hops = udp_traceroute_scapy(
+                self.primary_ip,
+                max_hops=self.args.max_hops,
+                timeout=self.args.timeout,
+            )
+            if self._udp_hops:
+                print()
+                print(
+                    _c(f"  {'TTL':>3}   {'IP':<18}{'Hostname':<30} {'RTT':<10} Notes", "cyan")
+                )
+                print(_c("  " + "─" * 60, "cyan"))
+                for hop in self._udp_hops:
+                    print(hop)
+            else:
+                print(_c("  No UDP replies — all UDP may be filtered.", "yellow"))
+
+        # ── 4. Firewall hop fingerprinting ───────────────────────────────────
+        print(_c("\n  [4/4] Firewall hop fingerprinting …", "cyan"))
+        all_hops = self._hops + self._udp_hops
+        fw_findings: List[Tuple[HopResult, str, str]] = []
+        for hop in all_hops:
+            result = fingerprint_firewall_hop(hop)
+            if result:
+                fw_type, desc = result
+                fw_findings.append((hop, fw_type, desc))
+
+        if fw_findings:
+            print()
+            for hop, fw_type, desc in fw_findings:
+                ip_str = hop.ip or "unknown"
+                print(
+                    f"  TTL {_c(str(hop.ttl), 'cyan'):>3}: "
+                    f"{_c(ip_str, 'yellow'):<20} "
+                    f"{_c(fw_type, 'red')} — {desc}"
+                )
+        else:
+            print(_c("  No ICMP firewall signals detected in recorded hops.", "white"))
+
+        # ── Silence analysis ─────────────────────────────────────────────────
+        self._analyse_silence_blocks()
+
+    def _print_multiport_table(self, ports: List[int]) -> None:
+        """Print aligned table of hop IPs for each port side-by-side."""
+        merged = merge_traceroute_results(self._port_results)
+        if not merged:
+            return
+
+        col_w = 20
+        header_row = f"  {'TTL':>3}  " + "".join(f":{p:<{col_w-1}}" for p in ports)
+        print()
+        print(_c(header_row, "cyan"))
+        print(_c("  " + "─" * (5 + col_w * len(ports)), "cyan"))
+
+        for row in merged:
+            ttl = row["ttl"]
+            cells = []
+            types_this_row = set()
+            for port in ports:
+                hop: Optional[HopResult] = row["per_port"].get(port)
+                if hop is None:
+                    cells.append("—" + " " * (col_w - 1))
+                elif hop.hop_type == "timeout":
+                    cells.append(_c("*" + " " * (col_w - 1), "red"))
+                    types_this_row.add("timeout")
+                else:
+                    ip_str = (hop.ip or "?")[:col_w - 1]
+                    colour = {
+                        "target":   "green",
+                        "firewall": "red",
+                        "transit":  "white",
+                    }.get(hop.hop_type, "white")
+                    cells.append(_c(ip_str.ljust(col_w), colour))
+                    types_this_row.add(hop.hop_type)
+
+            # Highlight rows where ports diverge (different IPs or one times out)
+            ips_this_row = set()
+            for port in ports:
+                hop = row["per_port"].get(port)
+                if hop and hop.ip:
+                    ips_this_row.add(hop.ip)
+
+            diverge_flag = ""
+            if len(ips_this_row) > 1:
+                diverge_flag = _c("  ← path diverges", "magenta")
+            elif "timeout" in types_this_row and types_this_row != {"timeout"}:
+                diverge_flag = _c("  ← firewall blocks some ports here", "yellow")
+            elif types_this_row == {"timeout"}:
+                diverge_flag = _c("  ← all ports filtered", "red")
+
+            print(f"  {ttl:>3}  " + "".join(cells) + diverge_flag)
+
+        print()
+        print(_c("  Legend:", "cyan"))
+        print("    " + _c("*", "red")       + " = timeout (filtered)   "
+              + _c("IP", "green")   + " = target   "
+              + _c("IP", "white")   + " = transit   "
+              + _c("← diverges", "magenta") + " = ECMP or different path")
+
+    def _analyse_silence_blocks(self) -> None:
+        """Report on blocks of consecutive timeouts in the primary trace."""
+        if not self._hops:
+            return
+
+        target_reached = any(h.hop_type == "target" for h in self._hops)
+        in_block = False
+        block_start = 0
+
+        for i, hop in enumerate(self._hops):
+            if hop.hop_type == "timeout" and not in_block:
+                in_block = True
+                block_start = hop.ttl
+            elif hop.hop_type != "timeout" and in_block:
+                in_block = False
+                msg = classify_silence(block_start, hop.ttl, target_reached)
+                print(_c(f"\n  [!] TTL {block_start}–{hop.ttl - 1}: {msg}", "yellow"))
+
+        if in_block:
+            last_ttl = self._hops[-1].ttl
+            msg = classify_silence(block_start, last_ttl, target_reached)
+            print(_c(f"\n  [!] TTL {block_start}–{last_ttl}: {msg}", "yellow"))
 
     def _fallback_traceroute(self) -> None:
         print(_c("  Falling back to system tracert/traceroute …", "yellow"))
@@ -1069,7 +1551,35 @@ class NetworkMapper:
         lines.append(f"    class {target_node_id} target")
         lines.append(f"    {prev_id} --> {target_node_id}")
 
-        # Subgraph: DNS info
+        # Application-layer proxy chain (from X-Forwarded-For / Via etc.)
+        # Shown as a separate subgraph connected to the target to indicate
+        # these are hops reported by the application, not network-layer hops.
+        if self._proxy_chain:
+            lines.append("")
+            lines.append("    %% ── Application-layer Proxy Chain ───────────")
+            lines.append("    subgraph APP_CHAIN [App-layer Proxy Chain]")
+            lines.append("    direction LR")
+            chain_ids = []
+            for i, entry in enumerate(self._proxy_chain):
+                nid = f"PROXY_{i}_{safe_id(entry.get('ip') or entry.get('hostname', str(i)))}"
+                ip_str   = entry.get("ip") or "?"
+                host_str = entry.get("hostname", "")
+                src_str  = entry.get("source", "")
+                label = f"{ip_str}"
+                if host_str and host_str != ip_str:
+                    label += f"\\n{host_str}"
+                label += f"\\n[{src_str}]"
+                lines.append(f'        {nid}["{label}"]')
+                lines.append(f"        class {nid} cdn")
+                chain_ids.append(nid)
+            lines.append("    end")
+            # Connect chain to target
+            if chain_ids:
+                lines.append(f"    {target_node_id} -.->|app sees| {chain_ids[0]}")
+                for j in range(len(chain_ids) - 1):
+                    lines.append(f"    {chain_ids[j]} --> {chain_ids[j+1]}")
+
+        # Subgraph: DNS / load balancing
         a_records = self._dns_records.get("A", [])
         if len(a_records) > 1:
             lines.append("")
@@ -1078,6 +1588,38 @@ class NetworkMapper:
             for ip in a_records:
                 nid = f"DNS_{safe_id(ip)}"
                 lines.append(f'        {nid}["{ip}"]')
+            lines.append("    end")
+
+        # Multi-port path comparison subgraph (--penetrate mode)
+        if self._port_results:
+            lines.append("")
+            lines.append("    %% ── Multi-port Path Comparison ──────────────")
+            lines.append("    subgraph MULTIPORT [Multi-port Traceroute Comparison]")
+            lines.append("    direction LR")
+            for port, hops in self._port_results.items():
+                if not hops:
+                    continue
+                prev_mp = None
+                for hop in hops:
+                    nid = f"MP_{port}_TTL{hop.ttl}"
+                    ip_str = hop.ip or "*"
+                    rtt_str = f" {hop.rtt_ms:.0f}ms" if hop.rtt_ms else ""
+                    label = f":{port} TTL{hop.ttl}\\n{ip_str}{rtt_str}"
+                    if hop.hop_type == "timeout":
+                        lines.append(f'        {nid}["{label}"]')
+                        lines.append(f"        class {nid} timeout")
+                    elif hop.hop_type == "firewall":
+                        lines.append(f'        {nid}{{{{"{label}"}}}}')
+                        lines.append(f"        class {nid} firewall")
+                    elif hop.hop_type == "target":
+                        lines.append(f'        {nid}(["{label}"])')
+                        lines.append(f"        class {nid} target")
+                    else:
+                        lines.append(f'        {nid}["{label}"]')
+                        lines.append(f"        class {nid} transit")
+                    if prev_mp:
+                        lines.append(f"        {prev_mp} --> {nid}")
+                    prev_mp = nid
             lines.append("    end")
 
         return "\n".join(lines)
@@ -1116,6 +1658,8 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   python networkmapper.py https://example.com
   python networkmapper.py https://example.com --max-hops 20 --port 80
+  python networkmapper.py https://example.com --penetrate
+  python networkmapper.py https://example.com --penetrate -o results.json --mermaid-file map.mmd
   python networkmapper.py https://example.com --no-traceroute --port-scan
   python networkmapper.py https://example.com --mermaid
   python networkmapper.py https://example.com --mermaid-file diagram.mmd
@@ -1123,10 +1667,12 @@ Examples:
   python networkmapper.py 10.0.0.1 --port 8080 --no-tls
 
 Notes:
-  TCP SYN traceroute requires Administrator (Windows) or root (Linux/macOS).
+  TCP SYN traceroute and --penetrate require Administrator (Windows) or root (Linux/macOS).
   Install scapy for best results:  pip install scapy
   Full install:  pip install scapy requests dnspython colorama
   Mermaid diagrams can be pasted into https://mermaid.live to render.
+  --penetrate runs multi-port + UDP traceroutes, port allowlist discovery, and
+  firewall fingerprinting to find paths that pass through the firewall.
 """,
     )
     p.add_argument("url", help="Target URL or host (e.g. https://example.com or 10.0.0.1)")
@@ -1141,6 +1687,14 @@ Notes:
     p.add_argument("--no-http",       action="store_true", help="Skip HTTP/WAF analysis")
     p.add_argument("--no-tls",        action="store_true", help="Skip TLS certificate check")
     p.add_argument("--port-scan",     action="store_true", help="Scan common ports at target")
+    p.add_argument(
+        "--penetrate", action="store_true",
+        help=(
+            "Firewall penetration mode: probe allowed ports, run multi-port TCP SYN "
+            "traceroute and UDP traceroute on all of them, compare paths to find where "
+            "filtering occurs, and fingerprint firewall devices."
+        ),
+    )
     p.add_argument(
         "--output", "-o", metavar="FILE",
         help="Save JSON summary to file",
@@ -1176,19 +1730,8 @@ def main() -> None:
 
     # JSON output
     if args.output:
-        data = {
-            "target":      args.url,
-            "host":        mapper.host,
-            "primary_ip":  mapper.primary_ip,
-            "all_ips":     mapper.target_ips,
-            "scheme":      mapper.scheme,
-            "port":        mapper.port,
-            "timestamp":   datetime.datetime.utcnow().isoformat() + "Z",
-            "http_status": mapper._http_status,
-            "waf_detected": mapper._waf_detected,
-            "open_ports":  {str(p): s for p, s in mapper._open_ports.items()},
-            "dns_records": mapper._dns_records,
-            "hops": [
+        def serialise_hops(hops):
+            return [
                 {
                     "ttl":      h.ttl,
                     "ip":       h.ip,
@@ -1197,8 +1740,30 @@ def main() -> None:
                     "type":     h.hop_type,
                     "notes":    h.notes,
                 }
-                for h in mapper._hops
-            ],
+                for h in hops
+            ]
+
+        data = {
+            "target":         args.url,
+            "host":           mapper.host,
+            "primary_ip":     mapper.primary_ip,
+            "all_ips":        mapper.target_ips,
+            "scheme":         mapper.scheme,
+            "port":           mapper.port,
+            "timestamp":      datetime.datetime.utcnow().isoformat() + "Z",
+            "http_status":    mapper._http_status,
+            "waf_detected":   mapper._waf_detected,
+            "proxy_chain":    mapper._proxy_chain,
+            "open_ports":     {str(p): s for p, s in mapper._open_ports.items()},
+            "dns_records":    mapper._dns_records,
+            "hops":           serialise_hops(mapper._hops),
+            "udp_hops":       serialise_hops(mapper._udp_hops),
+            "allowed_ports":  mapper._allowed_ports,
+            "filtered_ports": mapper._filtered_ports,
+            "multi_port_hops": {
+                str(port): serialise_hops(hops)
+                for port, hops in mapper._port_results.items()
+            },
         }
         with open(args.output, "w") as f:
             json.dump(data, f, indent=2)
